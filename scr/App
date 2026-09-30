@@ -535,6 +535,124 @@ const NewProjectScreen = ({ user, onProjectCreated, onCancel }: { user: Firebase
 
 const WorkspaceChatLayout = ({ user, projects, currentProject, setCurrentProject, onNewProject }: { user: FirebaseUser, projects: any[], currentProject: any, setCurrentProject: (p: any) => void, onNewProject: () => void }) => {
   const [inputText, setInputText] = useState('');
+  const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [voiceError, setVoiceError] = useState('');
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const recordingMimeTypeRef = useRef<string>('');
+
+  // Gemini's audio understanding supports WAV, MP3, AIFF, AAC, OGG, FLAC —
+  // notably NOT the "webm" format Chrome records by default. We ask the
+  // browser for OGG specifically so the transcription actually works.
+  const pickRecordingMimeType = (): string | null => {
+    const preferred = ['audio/ogg;codecs=opus', 'audio/ogg', 'audio/wav'];
+    for (const type of preferred) {
+      if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(type)) {
+        return type;
+      }
+    }
+    return null;
+  };
+
+  const startRecording = async () => {
+    setVoiceError('');
+    const mimeType = pickRecordingMimeType();
+    if (!mimeType) {
+      setVoiceError("Your browser can't record in a format Gemini supports (needs OGG or WAV). Try a different browser, like current Chrome or Firefox.");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream, { mimeType });
+      recordingMimeTypeRef.current = mimeType;
+      recordedChunksRef.current = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) recordedChunksRef.current.push(e.data);
+      };
+      recorder.onstop = () => {
+        stream.getTracks().forEach((t) => t.stop());
+        void transcribeRecording();
+      };
+
+      recorder.start();
+      mediaRecorderRef.current = recorder;
+      setIsRecording(true);
+
+      // Safety cap: auto-stop after 60 seconds so a forgotten recording
+      // doesn't run forever or produce an oversized upload.
+      setTimeout(() => {
+        if (mediaRecorderRef.current === recorder && recorder.state === 'recording') {
+          recorder.stop();
+        }
+      }, 60_000);
+    } catch (err: any) {
+      if (err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError') {
+        setVoiceError('Microphone access was denied. Please allow microphone access and try again.');
+      } else if (err?.name === 'NotFoundError') {
+        setVoiceError('No microphone found.');
+      } else {
+        setVoiceError('Could not start recording. Please try again.');
+      }
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      mediaRecorderRef.current.stop();
+    }
+    setIsRecording(false);
+  };
+
+  const transcribeRecording = async () => {
+    if (recordedChunksRef.current.length === 0) return;
+    setIsTranscribing(true);
+    setVoiceError('');
+    try {
+      const blob = new Blob(recordedChunksRef.current, { type: recordingMimeTypeRef.current });
+      const base64 = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const result = reader.result as string;
+          // Strip the "data:audio/ogg;base64," prefix — Gemini wants raw base64.
+          resolve(result.split(',')[1] || '');
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+
+      const token = await user.getIdToken();
+      const resp = await fetch('/api/transcribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ audioBase64: base64, mimeType: recordingMimeTypeRef.current }),
+      });
+      const data = await resp.json();
+
+      if (!resp.ok) {
+        setVoiceError(data.error || 'Transcription failed. Please try again.');
+        return;
+      }
+
+      // Drop the transcribed text into the input box for review — the
+      // user can edit it before sending, rather than it being sent
+      // automatically, since transcription can occasionally be wrong.
+      setInputText((prev) => (prev ? `${prev} ${data.text}` : data.text));
+    } catch (err) {
+      setVoiceError('Something went wrong sending the recording. Please try again.');
+    } finally {
+      setIsTranscribing(false);
+    }
+  };
+
+  const toggleRecording = () => {
+    if (isRecording) {
+      stopRecording();
+    } else {
+      startRecording();
+    }
+  };
   const [activeTab, setActiveTab] = useState<'chat' | 'progress'>('chat');
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
@@ -750,6 +868,12 @@ const WorkspaceChatLayout = ({ user, projects, currentProject, setCurrentProject
               <div ref={messagesEndRef} />
             </div>
 
+            {voiceError && (
+              <div className="mb-2 rounded-xl bg-red-50 border border-red-200 px-3 py-2 text-[12px] text-red-600 flex items-center justify-between">
+                <span>{voiceError}</span>
+                <button onClick={() => setVoiceError('')} className="ml-2 text-red-400 hover:text-red-600">✕</button>
+              </div>
+            )}
             <form className="w-full bg-white/42 backdrop-blur-lg border border-black/5 rounded-[20px] p-[16px_16px_12px] text-left shadow-[0_8px_30px_-15px_rgba(0,0,0,0.15)] shrink-0" onSubmit={handleSendMessage}>
               <textarea
                 value={inputText}
@@ -757,13 +881,29 @@ const WorkspaceChatLayout = ({ user, projects, currentProject, setCurrentProject
                 onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendMessage(e as any); } }}
                 className="w-full border-0 outline-none resize-none bg-transparent font-inherit text-[14px] leading-relaxed text-[#111111] min-h-[44px] p-1 placeholder:text-[#3d3d3d] placeholder:opacity-72"
                 rows={2}
-                placeholder="Type a message..."
+                placeholder={isTranscribing ? 'Transcribing your recording…' : 'Type a message...'}
+                disabled={isTranscribing}
               />
               <div className="flex items-center justify-between gap-3 mt-1">
                 <button className="inline-flex items-center justify-center w-[36px] h-[36px] rounded-full border border-black/10 bg-white text-[#1a1a1a] hover:bg-[#f1f1ef] transition-colors" type="button">
                   <Plus size={16} strokeWidth={2} />
                 </button>
                 <div className="flex items-center gap-2">
+                  <div className="relative flex items-center justify-center">
+                    {isRecording && <span className="absolute inset-0 rounded-full bg-red-500/40 animate-ping" />}
+                    <button
+                      type="button"
+                      onClick={toggleRecording}
+                      disabled={isTranscribing}
+                      aria-pressed={isRecording}
+                      aria-label={isRecording ? 'Stop recording' : 'Start voice input'}
+                      className={`relative inline-flex items-center justify-center w-[36px] h-[36px] rounded-full transition-colors disabled:opacity-50 ${
+                        isRecording ? 'bg-red-500 text-white' : 'border border-black/10 bg-white text-[#1a1a1a] hover:bg-[#f1f1ef]'
+                      }`}
+                    >
+                      {isTranscribing ? <Loader2 size={16} className="animate-spin" /> : <Mic size={16} strokeWidth={2} />}
+                    </button>
+                  </div>
                   <button className="inline-flex items-center justify-center bg-[#141414] text-white w-[40px] h-[40px] rounded-[12px] hover:bg-black transition-colors disabled:opacity-50" type="submit" disabled={!inputText.trim() || isSending}>
                     <Send size={16} strokeWidth={2} />
                   </button>
