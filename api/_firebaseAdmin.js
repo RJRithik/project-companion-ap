@@ -1,19 +1,19 @@
 // api/_firebaseAdmin.js
 //
-// Shared helper for API routes. Verifies that a request really comes from
-// the logged-in user it claims to be.
-//
-// FIX: the JSON.parse of the service account key now has a try/catch
-// around it. Before, if that value was malformed in any way, it would
-// throw at the moment this file loads — crashing EVERY function that
-// uses it (chat.js AND transcribe.js both), with no useful error message
-// anywhere. Now a bad key gives a clear, readable error instead.
+// FIX: switched from `import admin from "firebase-admin"` to Firebase's
+// dedicated modern-module imports (`firebase-admin/app`, `firebase-admin/
+// auth`). The old style doesn't reliably work in this kind of JavaScript
+// project setup — `admin.apps` could come back as undefined, crashing
+// immediately before even reaching our own code. This new style is the
+// one Firebase specifically ships for this situation.
 
-import admin from "firebase-admin";
+import { initializeApp, cert, getApps } from "firebase-admin/app";
+import { getAuth } from "firebase-admin/auth";
 
 let initError = null;
+let app = null;
 
-if (!admin.apps.length) {
+if (getApps().length === 0) {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
   if (!raw) {
     initError = "FIREBASE_SERVICE_ACCOUNT_KEY is not set in environment variables.";
@@ -21,28 +21,27 @@ if (!admin.apps.length) {
   } else {
     try {
       const serviceAccount = JSON.parse(raw);
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-      });
+      app = initializeApp({ credential: cert(serviceAccount) });
     } catch (e) {
       initError =
-        "FIREBASE_SERVICE_ACCOUNT_KEY is set but could not be parsed as valid JSON. " +
-        "This usually happens when the key's newlines get mangled during copy-paste. " +
-        "Re-download the key from Firebase console -> Project settings -> Service " +
-        "accounts -> Generate new private key, and paste its ENTIRE raw content as " +
-        "one Vercel environment variable value, without editing it. " +
-        "Underlying error: " + String(e);
+        "FIREBASE_SERVICE_ACCOUNT_KEY is set but could not be used. This usually " +
+        "means the JSON got mangled during copy-paste. Re-download the key from " +
+        "Firebase console -> Project settings -> Service accounts -> Generate new " +
+        "private key, and paste its ENTIRE raw content as one Vercel environment " +
+        "variable value. Underlying error: " + String(e);
       console.error("[ProjectPilot] " + initError);
     }
   }
+} else {
+  app = getApps()[0];
 }
 
 // Reads the "Authorization: Bearer <idToken>" header, verifies it against
 // Firebase, and returns the verified user's uid — or throws a readable
 // error if anything is wrong, including setup problems.
 export async function requireUser(req) {
-  if (initError) {
-    const err = new Error("Server authentication is misconfigured: " + initError);
+  if (initError || !app) {
+    const err = new Error("Server authentication is misconfigured: " + (initError || "unknown init failure"));
     err.statusCode = 500;
     throw err;
   }
@@ -55,7 +54,7 @@ export async function requireUser(req) {
     throw err;
   }
   try {
-    const decoded = await admin.auth().verifyIdToken(token);
+    const decoded = await getAuth(app).verifyIdToken(token);
     return decoded.uid;
   } catch (e) {
     const err = new Error("Invalid or expired authentication token.");
