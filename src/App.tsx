@@ -704,8 +704,9 @@ const WorkspaceChatLayout = ({ user, projects, currentProject, setCurrentProject
         // Show the REAL error from the server instead of a generic
         // message, so problems are visible instead of silently hidden.
         console.error('Chat request failed:', resp.status, data);
+        const detailText = data.details ? ` — ${typeof data.details === 'string' ? data.details.slice(0, 300) : JSON.stringify(data.details).slice(0, 300)}` : '';
         await addDoc(msgsRef, {
-          text: `⚠️ Server error (${resp.status}): ${data.error || 'Unknown error.'}`,
+          text: `⚠️ Server error (${resp.status}): ${data.error || 'Unknown error.'}${detailText}`,
           sender: 'ai',
           createdAt: Date.now(),
         });
