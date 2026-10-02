@@ -542,35 +542,30 @@ const WorkspaceChatLayout = ({ user, projects, currentProject, setCurrentProject
   const recordedChunksRef = useRef<Blob[]>([]);
   const recordingMimeTypeRef = useRef<string>('');
 
-  // Gemini supports audio formats including WEBM, MP4, WAV, MP3, AAC, OGG, FLAC.
-  const pickRecordingMimeType = (): string => {
-    const preferred = [
-      'audio/webm;codecs=opus',
-      'audio/webm',
-      'audio/mp4',
-      'audio/ogg;codecs=opus',
-      'audio/ogg',
-      'audio/wav'
-    ];
+  // Gemini's audio understanding supports WAV, MP3, AIFF, AAC, OGG, FLAC —
+  // notably NOT the "webm" format Chrome records by default. We ask the
+  // browser for OGG specifically so the transcription actually works.
+  const pickRecordingMimeType = (): string | null => {
+    const preferred = ['audio/ogg;codecs=opus', 'audio/ogg', 'audio/wav'];
     for (const type of preferred) {
       if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(type)) {
         return type;
       }
     }
-    return 'audio/webm';
+    return null;
   };
 
   const startRecording = async () => {
     setVoiceError('');
-    if (typeof MediaRecorder === 'undefined') {
-      setVoiceError("Audio recording is not supported in this browser.");
+    const mimeType = pickRecordingMimeType();
+    if (!mimeType) {
+      setVoiceError("Your browser can't record in a format Gemini supports (needs OGG or WAV). Try a different browser, like current Chrome or Firefox.");
       return;
     }
-    const mimeType = pickRecordingMimeType();
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream, MediaRecorder.isTypeSupported(mimeType) ? { mimeType } : undefined);
-      recordingMimeTypeRef.current = recorder.mimeType || mimeType || 'audio/webm';
+      const recorder = new MediaRecorder(stream, { mimeType });
+      recordingMimeTypeRef.current = mimeType;
       recordedChunksRef.current = [];
 
       recorder.ondataavailable = (e) => {
@@ -705,14 +700,26 @@ const WorkspaceChatLayout = ({ user, projects, currentProject, setCurrentProject
       });
       const data = await resp.json();
 
-      await addDoc(msgsRef, { text: data.reply || "I've noted that down.", sender: 'ai', createdAt: Date.now() });
+      if (!resp.ok) {
+        // Show the REAL error from the server instead of a generic
+        // message, so problems are visible instead of silently hidden.
+        console.error('Chat request failed:', resp.status, data);
+        await addDoc(msgsRef, {
+          text: `⚠️ Server error (${resp.status}): ${data.error || 'Unknown error.'}`,
+          sender: 'ai',
+          createdAt: Date.now(),
+        });
+        return;
+      }
+
+      await addDoc(msgsRef, { text: data.reply || "Got it.", sender: 'ai', createdAt: Date.now() });
 
       if (data.updates && Object.keys(data.updates).length > 0) {
         await updateDoc(projectRef, { ...data.updates, updatedAt: Date.now() });
       }
     } catch (err) {
-      console.error('Chat request failed', err);
-      await addDoc(msgsRef, { text: "Sorry, I couldn't reach the assistant just now. Please try again.", sender: 'ai', createdAt: Date.now() });
+      console.error('Chat request failed (network/exception)', err);
+      await addDoc(msgsRef, { text: `⚠️ Couldn't reach the assistant: ${String(err)}`, sender: 'ai', createdAt: Date.now() });
     } finally {
       setIsSending(false);
     }
