@@ -1,17 +1,19 @@
 // api/transcribe.js
 //
 // Takes a short recorded audio clip from the browser and returns its
-// text transcription, using Gemini's audio-understanding feature.
+// text transcription, using Gemini's audio-understanding feature (send
+// audio in, get text out — not real-time streaming, but far simpler and
+// more reliable to get right on the first try).
 
 import { requireUser } from "./_firebaseAdmin.js";
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
-// Gemini's supported audio formats (including webm & mp4 recorded by Chrome/Safari)
+// Gemini's documented supported audio formats. If the browser sends
+// something else, we reject clearly rather than silently failing or
+// getting a mysterious empty transcription back.
 const SUPPORTED_MIME_TYPES = [
-  "audio/webm",
-  "audio/mp4",
   "audio/wav",
   "audio/mp3",
   "audio/mpeg",
@@ -41,15 +43,14 @@ export default async function handler(req, res) {
   if (!audioBase64 || typeof audioBase64 !== "string") {
     return res.status(400).json({ error: "Missing 'audioBase64' in request body." });
   }
-  
-  const cleanMimeType = mimeType ? mimeType.split(';')[0].trim() : "audio/webm";
-  if (!SUPPORTED_MIME_TYPES.some((t) => cleanMimeType.startsWith(t))) {
+  if (!mimeType || !SUPPORTED_MIME_TYPES.some((t) => mimeType.startsWith(t))) {
     return res.status(400).json({
-      error: `Unsupported audio format '${cleanMimeType}'. Supported: ${SUPPORTED_MIME_TYPES.join(", ")}.`,
+      error: `Unsupported audio format '${mimeType}'. Supported: ${SUPPORTED_MIME_TYPES.join(", ")}.`,
     });
   }
 
-  // Safety cap ~15MB base64
+  // A rough safety cap so one request can't send a huge file — about 15MB
+  // of base64 text, comfortably under Gemini's 20MB total request limit.
   if (audioBase64.length > 15_000_000) {
     return res.status(400).json({ error: "Audio clip is too long. Please keep clips under about a minute." });
   }
@@ -64,7 +65,7 @@ export default async function handler(req, res) {
             role: "user",
             parts: [
               { text: "Transcribe this audio accurately. Return only the transcription text, with no commentary, quotes, or extra formatting." },
-              { inlineData: { mimeType: cleanMimeType, data: audioBase64 } },
+              { inlineData: { mimeType, data: audioBase64 } },
             ],
           },
         ],
